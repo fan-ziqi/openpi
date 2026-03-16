@@ -10,21 +10,23 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 import etils.epath as epath
 import flax.nnx as nnx
+import openpi.shared.nnx_utils as nnx_utils
 from typing_extensions import override
 import tyro
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
+import openpi.models.pi05_config as pi05_config
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.arx_policy as arx_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.libero_subtask_policy as libero_subtask_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
-import openpi.training.misc.polaris_config as polaris_config
-import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -94,8 +96,8 @@ class DataConfig:
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
     action_space: droid_rlds_dataset.DroidActionSpace | None = None
-    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # Path to the data filter file for DROID dataset
+    filter_dict_path: str | None = None
 
 
 class GroupFactory(Protocol):
@@ -124,7 +126,7 @@ class ModelTransformFactory(GroupFactory):
                     ],
                 )
             case _model.ModelType.PI05:
-                assert isinstance(model_config, pi0_config.Pi0Config)
+                # Support both Pi05Config and Pi0Config with pi05=True
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -164,6 +166,36 @@ class ModelTransformFactory(GroupFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class SubtaskModelTransformFactory(GroupFactory):
+    """Creates model transforms for subtask-based hierarchical learning."""
+
+    def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        match model_config.model_type:
+            case _model.ModelType.PI05:
+                # Use FAST tokens only if fast_token_loss_weight > 0
+                use_fast_tokens = getattr(model_config, "fast_token_loss_weight", 0.0) > 0
+
+                # Build tokenizer kwargs (with or without FAST tokenizer path)
+                tokenizer_kwargs = {"max_len": model_config.max_token_len}
+                if use_fast_tokens:
+                    fast_tokenizer_path = getattr(model_config, "fast_tokenizer_path", "physical-intelligence/fast")
+                    tokenizer_kwargs["fast_tokenizer_path"] = fast_tokenizer_path
+
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizeHighLowPrompt(
+                            _tokenizer.PaligemmaTokenizer(**tokenizer_kwargs),
+                            use_fast_tokens=use_fast_tokens,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
+            case _:
+                raise ValueError(f"Subtask mode only supports PI05 model type, got {model_config.model_type}")
+
+
+@dataclasses.dataclass(frozen=True)
 class DataConfigFactory(abc.ABC):
     # The LeRobot repo id.
     repo_id: str = tyro.MISSING
@@ -184,7 +216,7 @@ class DataConfigFactory(abc.ABC):
             repo_id=repo_id,
             asset_id=asset_id,
             norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=model_config.model_type != ModelType.PI0,
+            # use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
@@ -367,16 +399,8 @@ class RLDSDroidDataConfig(DataConfigFactory):
     # Filtering options. Can pass a path to a dictionary that maps episodes to timestep ranges
     # to tuples denoting ranges of time steps to keep (start, end). Episodes are uniquely identified with
     # f"{recording_folderpath}--{file_path}", both of which are present in the RLDS episode metadata.
-
-    # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
-    datasets: Sequence[droid_rlds_dataset.RLDSDataset] = (
-        droid_rlds_dataset.RLDSDataset(
-            name="droid",
-            version="1.0.1",
-            weight=1.0,
-            filter_dict_path="gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json",
-        ),
-    )
+    # Path to the filter dictionary file.
+    filter_dict_path: str | None = "gs://openpi-assets/droid/droid_sample_ranges_v1_0_1.json"
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -419,7 +443,7 @@ class RLDSDroidDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             rlds_data_dir=self.rlds_data_dir,
             action_space=self.action_space,
-            datasets=self.datasets,
+            filter_dict_path=self.filter_dict_path,
         )
 
 
@@ -453,6 +477,51 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             outputs=[droid_policy.DroidOutputs()],
         )
         model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotLiberoSubtaskDataConfig(DataConfigFactory):
+    """
+    Data config for Libero environment with subtask support.
+    Assumes features stored as:
+      - images.agentview_rgb: image (3, 256, 256) uint8
+      - images.wrist_rgb: image (3, 256, 256) uint8
+      - state: float32, shape (8,)
+      - actions: float32, shape (horizon, 7)
+      - task: string (high-level task)
+      - subtask: string (low-level subtask)
+    """
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images.agentview_rgb": "images.agentview_rgb",
+                        # Map dataset wrist image name to the expected key.
+                        "images.wrist_rgb_left": "images.wrist_rgb",
+                        "state": "state",
+                        "actions": "actions",
+                        "task": "task",
+                        "subtask": "subtask",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[libero_subtask_policy.LiberoSubtaskInputs(model_type=model_config.model_type)],
+            outputs=[libero_subtask_policy.LiberoSubtaskOutputs()],
+        )
+
+        model_transforms = SubtaskModelTransformFactory()(model_config)
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -496,9 +565,9 @@ class TrainConfig:
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
     # Base directory for config assets (e.g., norm stats).
-    assets_base_dir: str = "./assets"
+    assets_base_dir: str = "~/.cache/openpi/openpi-assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_base_dir: str = "~/.cache/openpi/openpi-checkpoints"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -513,9 +582,9 @@ class TrainConfig:
     # How often (in steps) to log training metrics.
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 5000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
-    keep_period: int | None = 5000
+    keep_period: int | None = 1000
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -523,7 +592,7 @@ class TrainConfig:
     resume: bool = False
 
     # If true, will enable wandb logging.
-    wandb_enabled: bool = True
+    wandb_enabled: bool = False
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -537,14 +606,14 @@ class TrainConfig:
     @property
     def assets_dirs(self) -> pathlib.Path:
         """Get the assets directory for this config."""
-        return (pathlib.Path(self.assets_base_dir) / self.name).resolve()
+        return (pathlib.Path(self.assets_base_dir).expanduser() / self.name).resolve()
 
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         """Get the checkpoint directory for this config."""
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
-        return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+        return (pathlib.Path(self.checkpoint_base_dir).expanduser() / self.name / self.exp_name).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -558,7 +627,168 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
-    #
+    # ⭐ Libero Subtask Training Configurations - Three libero training modes
+    
+    # Mode 1: Subtask + Flow Matching (Original Pi05 style)
+    TrainConfig(
+        name="libero_pi05_subtask_flow",
+        exp_name="libero_pi05_subtask_flow",
+        model=pi05_config.Pi05Config(
+            action_horizon=10,
+            max_token_len=256,
+            discrete_state_input=False,
+            # ⭐ Only use subtask and flow matching loss
+            subtask_loss_weight=1.0,
+            fast_token_loss_weight=0.0,  # Disable FAST token loss
+            flow_matching_loss_weight=1.0,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/kewang/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="KeWangRobotics/libero_10_subtasks",
+            base_config=DataConfig(
+                asset_id="libero_subtask",
+                use_quantile_norm=True,  # ⭐ Use quantile normalization for gripper actions
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3000,
+            peak_lr=2.5e-5,
+            decay_steps=150_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=100_000,
+        save_interval=10000,
+        batch_size=32,
+        fsdp_devices=8,
+        ema_decay=0.999,
+        wandb_enabled=True,
+
+    ),
+    
+    # Mode 2: Subtask + FAST Token (Discrete action tokens)
+    TrainConfig(
+        name="libero_pi05_subtask_fast",
+        exp_name="libero_subtask_fast",
+        model=pi05_config.Pi05Config(
+            action_horizon=25,
+            max_token_len=256,
+            discrete_state_input=False,
+            # ⭐ Only use subtask and FAST token loss
+            subtask_loss_weight=10.0,
+            fast_token_loss_weight=1.0,  # Enable FAST token loss weight
+            flow_matching_loss_weight=0.0,  # Disable flow matching
+            fast_tokenizer_path="physical-intelligence/fast",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/kewang/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="KeWangRobotics/libero_10_subtasks",
+            base_config=DataConfig(
+                asset_id="libero_subtask",
+                use_quantile_norm=True,  # ⭐ Use quantile normalization for gripper actions
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3000,
+            peak_lr=2.5e-5,
+            decay_steps=150_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=20_000,
+        save_interval=4000,
+        batch_size=512,
+        fsdp_devices=8,
+        ema_decay=0.999,
+        wandb_enabled=True,
+    ),
+        
+    # Mode 3: Action Expert
+    TrainConfig(
+        name="libero_pi05_action_expert",
+        exp_name="libero_action_expert",
+        model=pi05_config.Pi05Config(
+            action_horizon=25,
+            max_token_len=256,
+            discrete_state_input=False,
+            # ⭐ Only use action expert loss
+            subtask_loss_weight=0.0,
+            fast_token_loss_weight=0.0,  
+            flow_matching_loss_weight=1.0,  # Enable flow matching
+            fast_tokenizer_path="physical-intelligence/fast",
+            stop_gradient_flow_to_prefix=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/kewang/.cache/openpi/openpi-checkpoints/libero_pi05_subtask_fast/my_experiment/12000/params"
+        ),
+        
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="KeWangRobotics/libero_10_subtasks",
+            base_config=DataConfig(
+                asset_id="libero_subtask",
+                use_quantile_norm=True,  # ⭐ Use quantile normalization for gripper actions
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3000,
+            peak_lr=2.5e-5,
+            decay_steps=150_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=8_000,
+        save_interval=2000,
+        batch_size=512,
+        fsdp_devices=8,
+        ema_decay=0.999,
+        wandb_enabled=True,
+
+        freeze_filter=nnx.All(
+         nnx.Param,
+         nnx_utils.PathRegex(".*llm.*"),             # match all LLM layers
+         nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")) # exclude action expert branch
+     )
+    ),
+    
+    # Mode 3: Subtask + FAST + Flow (Hybrid - All three losses)
+    TrainConfig(
+        name="libero_pi05_subtask_hybrid",
+        exp_name="libero_subtask_hybrid",
+        model=pi05_config.Pi05Config(
+            action_horizon=20,
+            max_token_len=192,
+            discrete_state_input=False,
+            # ⭐ Use all three losses
+            subtask_loss_weight=0.15,
+            fast_token_loss_weight=0.15,  # Lower weight for FAST tokens
+            flow_matching_loss_weight=1.0,  # Lower weight for flow matching
+            fast_tokenizer_path="physical-intelligence/fast",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/kewang/.cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        data=LeRobotLiberoSubtaskDataConfig(
+            repo_id="KeWangRobotics/libero_10_subtasks",
+            base_config=DataConfig(
+                asset_id="libero_subtask",
+                use_quantile_norm=True,  # ⭐ Use quantile normalization for gripper actions
+            ),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=3000,
+            peak_lr=2.5e-5,
+            decay_steps=150_000,
+            decay_lr=2.5e-6,
+        ),
+        num_train_steps=40_000,
+        save_interval=5000,
+        batch_size=64,
+        fsdp_devices=1,
+        ema_decay=0.999,
+    ),
+
     # Inference Aloha configs.
     #
     TrainConfig(
@@ -765,7 +995,7 @@ _CONFIGS = [
     # Fine-tuning Aloha configs.
     #
     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
-    # For instructions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
+    # For instuctions on how to convert and train on your own Aloha dataset see examples/aloha_real/README.md
     TrainConfig(
         name="pi0_aloha_pen_uncap",
         model=pi0_config.Pi0Config(),
@@ -930,44 +1160,6 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
     ),
-    #
-    # Debugging configs.
-    #
-    TrainConfig(
-        name="debug",
-        data=FakeDataConfig(),
-        batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        save_interval=100,
-        overwrite=True,
-        exp_name="debug",
-        num_train_steps=10,
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_restore",
-        data=FakeDataConfig(),
-        batch_size=2,
-        model=pi0_config.Pi0Config(paligemma_variant="dummy", action_expert_variant="dummy"),
-        weight_loader=weight_loaders.CheckpointWeightLoader("./checkpoints/debug/debug/9/params"),
-        overwrite=True,
-        exp_name="debug",
-        num_train_steps=10,
-        wandb_enabled=False,
-    ),
-    TrainConfig(
-        name="debug_pi05",
-        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="dummy", action_expert_variant="dummy"),
-        data=FakeDataConfig(),
-        batch_size=2,
-        num_train_steps=10,
-        overwrite=True,
-        exp_name="debug_pi05",
-        wandb_enabled=False,
-    ),
-    # RoboArena & PolaRiS configs.
-    *roboarena_config.get_roboarena_configs(),
-    *polaris_config.get_polaris_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

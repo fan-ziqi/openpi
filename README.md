@@ -1,4 +1,8 @@
 # openpi
+**This is the modified version of the original openpi. Here the subtask generation capability is added to pi05 and a benchmark of LIBERO-10 is performed to show its advantage. To run subtask training, modify to your own datasets, and benchmarking with LIBERO, have a look at [SUBTASK_README](README_subtask.md).**
+
+**I also write a blog post explaining the Pi05 architecture and walk through the implementations https://shorturl.at/qIsj3.**
+
 
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
@@ -16,7 +20,7 @@ This is an experiment: $\pi_0$ was developed for our own robots, which differ fr
 - [Sept 2025] We released PyTorch support in openpi.
 - [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
 - [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
+- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID.
 
 
 ## Requirements
