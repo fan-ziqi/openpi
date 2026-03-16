@@ -10,6 +10,7 @@ from typing_extensions import override
 from openpi.models import model as _model
 from openpi.models import pi0_config
 import openpi.models.gemma as _gemma
+import openpi.models.pointnet as _pointnet
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
@@ -67,6 +68,7 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.pcd = config.pcd
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -98,6 +100,18 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_in = nnx.Linear(2 * action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        if self.pcd:
+            pointnet_config = _pointnet.get_config(config.pointnet_variant)
+            self.pointnet = nnx_bridge.ToNNX(
+                _pointnet.UncoloredPointNet(
+                    n_coordinates=pointnet_config.n_coordinates,
+                    output_dim=pointnet_config.output_dim,
+                    hidden_dim=pointnet_config.hidden_dim,
+                    hidden_depth=pointnet_config.hidden_depth,
+                )
+            )
+            self.pointnet.lazy_init(config.fake_obs().pcd_xyz, rngs=rngs)
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
@@ -131,6 +145,14 @@ class Pi0(_model.BaseModel):
             input_mask.append(obs.tokenized_prompt_mask)
             # full attention between image and language inputs
             ar_mask += [False] * tokenized_inputs.shape[1]
+
+        # add point cloud
+        if self.pcd:
+            pcd_tokens = self.pointnet(obs.pcd_xyz)  # (b s=16 2048)
+            tokens.append(pcd_tokens)
+            input_mask.append(jnp.ones(pcd_tokens.shape[:2], dtype=jnp.bool_))
+            ar_mask += [False] * pcd_tokens.shape[1]
+
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
         ar_mask = jnp.array(ar_mask)
@@ -179,9 +201,10 @@ class Pi0(_model.BaseModel):
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
         # image/language/state inputs do not attend to action tokens
-        ar_mask += [True] + ([False] * (self.action_horizon - 1))
+        # ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
         input_mask = jnp.concatenate(input_mask, axis=1)
+        ar_mask += [True] + ([False] * (input_mask.shape[1] - 1))
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 

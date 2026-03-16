@@ -88,25 +88,65 @@ def create_rlds_dataloader(
 
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
-
-    if data_config.rlds_data_dir is not None:
-        data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
-        )
+    if isinstance(config.data, list):
+        data_config = config.data[0].create(config.assets_dirs, config.model)
     else:
-        data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+        data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.behavior_dataset_root:
+        from omnigibson.learning.datas import BehaviorLerobotDatasetMetadata
+
+        from openpi.policies.b1k_policy import extract_state_from_proprio
+
+        metadata = BehaviorLerobotDatasetMetadata(
+            repo_id=data_config.repo_id,
+            root=data_config.behavior_dataset_root,
+            tasks=data_config.tasks,
+            modalities=[],
+            cameras=[],
         )
+        stats = metadata.stats
+        if data_config.episodes_index is not None:
+            from omnigibson.learning.datas import BehaviorLeRobotDataset
 
-    keys = ["state", "actions"]
-    stats = {key: normalize.RunningStats() for key in keys}
+            dataset = BehaviorLeRobotDataset(
+                repo_id=data_config.repo_id,
+                root=data_config.behavior_dataset_root,
+                tasks=data_config.tasks,
+                modalities=[],
+                cameras=[],
+                episodes=data_config.episodes_index,
+            )
+            stats = dataset.stats
 
-    for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
-        for key in keys:
-            stats[key].update(np.asarray(batch[key]))
+        norm_stats = {"state": {}, "actions": {}}
+        for key in ["mean", "std", "q01", "q99"]:
+            norm_stats["state"][key] = transforms.pad_to_dim(
+                extract_state_from_proprio(stats["observation.state"][key]), config.model.action_dim
+            )
+            norm_stats["actions"][key] = transforms.pad_to_dim(stats["action"][key], config.model.action_dim)
+    else:
+        if data_config.rlds_data_dir is not None:
+            data_loader, num_batches = create_rlds_dataloader(
+                data_config, config.model.action_horizon, config.batch_size, max_frames
+            )
+        else:
+            data_loader, num_batches = create_torch_dataloader(
+                data_config,
+                config.model.action_horizon,
+                config.batch_size,
+                config.model,
+                config.num_workers,
+                max_frames,
+            )
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+        keys = ["state", "actions"]
+        stats = {key: normalize.RunningStats() for key in keys}
+
+        for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
+            for key in keys:
+                stats[key].update(np.asarray(batch[key]))
+
+        norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")

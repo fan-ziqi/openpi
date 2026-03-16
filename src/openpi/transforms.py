@@ -196,7 +196,8 @@ class SubsampleActions(DataTransformFn):
     stride: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["actions"] = data["actions"][:: self.stride]
+        if "actions" in data:
+            data["actions"] = data["actions"][:: self.stride]
         return data
 
 
@@ -235,12 +236,71 @@ class AbsoluteActions(DataTransformFn):
         if "actions" not in data or self.mask is None:
             return data
 
-        state, actions = data["state"], data["actions"]
+        state, actions = data["state"], data["actions"].copy()
         mask = np.asarray(self.mask)
         dims = mask.shape[-1]
         actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class ArrangeStateActions(DataTransformFn):
+    """Rearranges action dimensions according to the provided indices."""
+
+    # Indices for reindexing the action dimensions. Length can be smaller than the actual
+    # number of dimensions. Only the first len(indices) dimensions will be rearranged.
+    # If None, this transform is a no-op.
+    indices: Sequence[int] | None
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.indices is None:
+            return data
+
+        dims = len(self.indices)
+
+        if "actions" in data:
+            actions = data["actions"]
+            actions[..., :dims] = actions[..., self.indices]
+            data["actions"] = actions
+
+        if "state" in data:
+            state = data["state"]
+            state[..., :dims] = state[..., self.indices]
+            data["state"] = state
+
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class RearrangeStateActions(DataTransformFn):
+    """Rearranges action dimensions according to the provided indices."""
+
+    indices: Sequence[int] | None
+    reindices: Sequence[int] | None = None
+
+    def __post_init__(self):
+        if self.indices is not None and self.reindices is None:
+            ri = np.argsort(self.indices)
+            object.__setattr__(self, "reindices", ri)
+            print(f"reindices: {self.reindices}")
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if self.indices is None:
+            return data
+
+        dims = len(self.reindices)
+
+        if "actions" in data:
+            actions = data["actions"].copy()
+            actions[..., :dims] = actions[..., self.reindices]
+            data["actions"] = actions
+
+        if "state" in data:
+            state = data["state"].copy()
+            state[..., :dims] = state[..., self.reindices]
+            data["state"] = state
         return data
 
 
@@ -322,6 +382,14 @@ class PromptFromLeRobotTask(DataTransformFn):
             raise ValueError(f"{task_index=} not found in task mapping: {self.tasks}")
 
         return {**data, "prompt": prompt}
+
+
+@dataclasses.dataclass(frozen=True)
+class PromptFromLeRobotItem(DataTransformFn):
+    """Extracts a prompt from the current LeRobot dataset task."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        return {**data, "prompt": data.pop("task")}
 
 
 @dataclasses.dataclass(frozen=True)

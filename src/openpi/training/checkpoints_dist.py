@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import asyncio
-import concurrent.futures as futures
 import dataclasses
 import logging
 from typing import Protocol
 
 from etils import epath
 import jax
+import numpy as np
 import orbax.checkpoint as ocp
-import orbax.checkpoint.future as future
+from orbax.checkpoint import type_handlers
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
@@ -18,7 +17,11 @@ import openpi.training.utils as training_utils
 
 
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
@@ -41,18 +44,36 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    custom_registry = type_handlers.create_type_handler_registry(
+        (int, type_handlers.ScalarHandler()),
+        (float, type_handlers.ScalarHandler()),
+        (bytes, type_handlers.ScalarHandler()),
+        (np.number, type_handlers.ScalarHandler()),
+        (np.ndarray, type_handlers.NumpyHandler()),
+        (jax.Array, type_handlers.ArrayHandler(array_metadata_store=None)),
+        (str, type_handlers.StringHandler()),
+    )
+
+    train_state_handler = ocp.PyTreeCheckpointHandler(use_ocdbt=False, type_handler_registry=custom_registry)
+    params_handler = ocp.PyTreeCheckpointHandler(use_ocdbt=False, type_handler_registry=custom_registry)
+
+    logging.info(f"use_ocdbt(train_state)={getattr(train_state_handler, 'use_ocdbt', None)}")
+    logging.info(f"use_ocdbt(params)={getattr(params_handler, 'use_ocdbt', None)}")
+    logging.info("ArrayMetadata Store disabled to avoid multi-host synchronization issues")
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
             "assets": CallbackHandler(),
-            "train_state": ocp.PyTreeCheckpointHandler(),
-            "params": ocp.PyTreeCheckpointHandler(),
+            "train_state": train_state_handler,
+            "params": params_handler,
         },
         options=ocp.CheckpointManagerOptions(
             max_to_keep=1,
             keep_period=keep_period,
             create=False,
-            async_options=ocp.AsyncOptions(timeout_secs=7200),
+            enable_async_checkpointing=False,
+            async_options=None,
         ),
     )
 
@@ -87,7 +108,16 @@ def save_state(
         "train_state": train_state,
         "params": {"params": params},
     }
+
+    # Log checkpoint saving info based on mode
+    if jax.process_index() == 0:
+        logging.info(f"Saving checkpoint at step {step} (synchronous mode)...")
+
     checkpoint_manager.save(step, items)
+    checkpoint_manager.wait_until_finished()
+
+    if jax.process_index() == 0:
+        logging.info(f"Checkpoint at step {step} saved successfully")
 
 
 def restore_state(
@@ -122,15 +152,12 @@ class Callback(Protocol):
     def __call__(self, directory: epath.Path) -> None: ...
 
 
-class CallbackHandler(ocp.AsyncCheckpointHandler):
+class CallbackHandler(ocp.CheckpointHandler):
     """A CheckpointHandler for calling an arbitrary function asynchronously. Only for saving, not for restoring."""
 
     def save(self, directory: epath.Path, args: CallbackSave):
         if jax.process_index() == 0:
             args.callback(directory)
-
-    async def async_save(self, directory: epath.Path, args: CallbackSave) -> list[futures.Future]:
-        return [future.CommitFutureAwaitingContractedSignals(asyncio.to_thread(self.save, directory, args))]
 
     def restore(self, *args, **kwargs):
         raise NotImplementedError("CallbackHandler does not support restore")

@@ -44,7 +44,7 @@ import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
-import openpi.training.data_loader as _data
+import openpi.training.data_loader as _data_loader
 
 
 def init_logging():
@@ -124,7 +124,16 @@ def set_seed(seed: int, local_rank: int):
 
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+    # data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=True)
+    data_loader = _data_loader.create_torch_behavior_data_loader(
+        config,
+        action_horizon=config.model.action_horizon,
+        batch_size=config.batch_size,
+        skip_norm_stats=False,
+        shuffle=True,
+        num_workers=config.num_workers,
+        seed=config.seed,
+    )
     return data_loader, data_loader.data_config()
 
 
@@ -358,36 +367,36 @@ def train_loop(config: _config.TrainConfig):
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
 
-    # Log sample images to wandb on first batch
-    if is_main and config.wandb_enabled and not resuming:
-        # Create a separate data loader for sample batch to avoid consuming the main loader
-        sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
-        sample_batch = next(iter(sample_data_loader))
-        # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
-        sample_batch = observation.to_dict()
-        sample_batch["actions"] = actions
+    # # Log sample images to wandb on first batch
+    # if is_main and config.wandb_enabled and not resuming:
+    #     # Create a separate data loader for sample batch to avoid consuming the main loader
+    #     sample_data_loader = _data_loader.create_data_loader(config, framework="pytorch", shuffle=False)
+    #     sample_batch = next(iter(sample_data_loader))
+    #     # Convert observation and actions to torch tensors
+    #     observation, actions = sample_batch
+    #     sample_batch = observation.to_dict()
+    #     sample_batch["actions"] = actions
 
-        # Create sample images for wandb
-        images_to_log = []
-        # Get batch size from the first image tensor
-        batch_size = next(iter(sample_batch["image"].values())).shape[0]
-        for i in range(min(5, batch_size)):
-            # Concatenate all camera views horizontally for this batch item
-            # Convert from NCHW to NHWC format for wandb
-            img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
-            img_concatenated = img_concatenated.cpu().numpy()
-            images_to_log.append(wandb.Image(img_concatenated))
+    #     # Create sample images for wandb
+    #     images_to_log = []
+    #     # Get batch size from the first image tensor
+    #     batch_size = next(iter(sample_batch["image"].values())).shape[0]
+    #     for i in range(min(5, batch_size)):
+    #         # Concatenate all camera views horizontally for this batch item
+    #         # Convert from NCHW to NHWC format for wandb
+    #         img_concatenated = torch.cat([img[i].permute(1, 2, 0) for img in sample_batch["image"].values()], axis=1)
+    #         img_concatenated = img_concatenated.cpu().numpy()
+    #         images_to_log.append(wandb.Image(img_concatenated))
 
-        wandb.log({"camera_views": images_to_log}, step=0)
+    #     wandb.log({"camera_views": images_to_log}, step=0)
 
-        # Clear sample batch from memory aggressively
-        del sample_batch, observation, actions, images_to_log, img_concatenated
-        del sample_data_loader  # Also delete the sample data loader
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        logging.info("Cleared sample batch and data loader from memory")
+    #     # Clear sample batch from memory aggressively
+    #     del sample_batch, observation, actions, images_to_log, img_concatenated
+    #     del sample_data_loader  # Also delete the sample data loader
+    #     gc.collect()
+    #     if torch.cuda.is_available():
+    #         torch.cuda.empty_cache()
+    #     logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):

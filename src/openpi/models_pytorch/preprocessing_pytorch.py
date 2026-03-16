@@ -33,9 +33,13 @@ def preprocess_observation_pytorch(
 
     batch_shape = observation.state.shape[:-1]
 
+    meta_image_keys = [k for k in observation.images if k not in image_keys]
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
+
+        if key == "base_0_rgb":
+            image = torch.cat([image, *(observation.images[k] for k in meta_image_keys)], dim=0)  # b + m * b
 
         # TODO: This is a hack to handle both [B, C, H, W] and [B, H, W, C] formats
         # Handle both [B, C, H, W] and [B, H, W, C] formats
@@ -54,9 +58,9 @@ def preprocess_observation_pytorch(
             image = image / 2.0 + 0.5
 
             # Apply PyTorch-based augmentations
-            if "wrist" not in key:
+            if key == "base_0_rgb":
                 # Geometric augmentations for non-wrist cameras
-                height, width = image.shape[1:3]
+                batch, height, width = image.shape[:3]
 
                 # Random crop and resize
                 crop_height = int(height * 0.95)
@@ -116,6 +120,15 @@ def preprocess_observation_pytorch(
                         align_corners=False,
                     ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
 
+                # split back into base_image and meta_images
+                split_images = torch.split(image, batch // (1 + len(meta_image_keys)), dim=0)
+                image = split_images[0]
+                for i, meta_key in enumerate(meta_image_keys):
+                    meta_image = split_images[i + 1]
+                    if is_channels_first:
+                        meta_image = split_images[i + 1].permute(0, 3, 1, 2)
+                    out_images[meta_key] = meta_image * 2.0 - 1.0
+
             # Color augmentations for all cameras
             # Random brightness
             # Use tensor operations instead of .item() for torch.compile compatibility
@@ -140,6 +153,19 @@ def preprocess_observation_pytorch(
 
             # Back to [-1, 1]
             image = image * 2.0 - 1.0
+
+        elif key == "base_0_rgb":
+            batch, height, width = image.shape[:3]
+
+            # split back into base_image and meta_images
+            split_images = torch.split(image, batch // (1 + len(meta_image_keys)), dim=0)
+            image = split_images[0]
+            for i, meta_key in enumerate(meta_image_keys):
+                if is_channels_first:
+                    meta_image = split_images[i + 1].permute(0, 3, 1, 2)
+                else:
+                    meta_image = split_images[i + 1]
+                out_images[meta_key] = meta_image
 
         # Convert back to [B, C, H, W] format if it was originally channels-first
         if is_channels_first:
